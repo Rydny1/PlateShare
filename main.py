@@ -186,6 +186,25 @@ def parse_new_offer(argument: str) -> tuple[str, int] | None:
     return description, quantity
 
 
+def claim_url(offer_id: int, phone: str) -> str | None:
+    base_url = os.getenv("APP_BASE_URL", "").rstrip("/")
+    if not base_url:
+        return None
+    return f"{base_url}/claim/{offer_id}?phone={quote(phone, safe='')}"
+
+
+def demo_offer_message(offer: Offer, phone: str) -> str:
+    link = claim_url(offer.id, phone)
+    link_text = f"\n\nClaim here: {link}" if link else ""
+    return (
+        "Demo offer created!\n\n"
+        f"{offer.description}\n"
+        f"{offer.remaining_quantity} portions available\n\n"
+        f"Reply claim:{offer.id} to claim one portion."
+        f"{link_text}"
+    )
+
+
 def notify_students(db: Session, offer: Offer, notifier=safe_send_claim_button) -> None:
     students = list(db.scalars(select(Student).order_by(Student.id)))
     for student in students:
@@ -252,8 +271,7 @@ def handle_staff_command(
             return "The demo command is only available through a messaging webhook."
         description, quantity = parsed
         offer = create_offer(db, description, quantity)
-        notifier(sender_phone, offer)
-        return f"Demo offer #{offer.id} created and sent to this phone only."
+        return demo_offer_message(offer, sender_phone)
 
     if command == "/new":
         parsed = parse_new_offer(argument)
