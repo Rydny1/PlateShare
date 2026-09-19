@@ -1,5 +1,7 @@
 import logging
+import json
 import os
+from urllib.parse import quote
 
 from dotenv import load_dotenv
 from twilio.rest import Client
@@ -39,12 +41,36 @@ def send_text(to: str, message: str) -> None:
     )
 
 
-def send_claim_message(to: str, offer_id: int, description: str, remaining: int) -> None:
+def send_claim_message(
+    to: str,
+    offer_id: int,
+    description: str,
+    remaining: int,
+    claim_url: str | None = None,
+) -> None:
+    content_sid = os.getenv("TWILIO_OFFER_CONTENT_SID")
+    if content_sid and claim_url:
+        _client().messages.create(
+            from_=_from_address(),
+            to=_whatsapp_address(to),
+            content_sid=content_sid,
+            content_variables=json.dumps(
+                {
+                    "1": description,
+                    "2": str(remaining),
+                    "3": claim_url,
+                }
+            ),
+        )
+        return
+
+    button_text = f"\n\nClaim here: {claim_url}" if claim_url else ""
     send_text(
         to,
         "Leftover food available!\n\n"
         f"{description}\n"
         f"{remaining} portions available\n\n"
-        f"Reply claim:{offer_id} to claim one portion.\n"
+        f"Reply claim:{offer_id} to claim one portion."
+        f"{button_text}\n"
         "First come, first served!",
     )

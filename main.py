@@ -4,9 +4,10 @@ import re
 from contextlib import asynccontextmanager
 from html import escape
 from typing import Any
+from urllib.parse import quote
 
 from fastapi import Depends, FastAPI, Query, Request
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -62,7 +63,20 @@ def safe_send_twilio_text(to: str, message: str) -> None:
 
 def safe_send_twilio_claim_message(to: str, offer: Offer) -> None:
     try:
-        send_claim_message(to, offer.id, offer.description, offer.remaining_quantity)
+        base_url = os.getenv("APP_BASE_URL", "").rstrip("/")
+        claim_url = None
+        if base_url:
+            claim_url = (
+                f"{base_url}/claim/{offer.id}"
+                f"?phone={quote(to, safe='')}"
+            )
+        send_claim_message(
+            to,
+            offer.id,
+            offer.description,
+            offer.remaining_quantity,
+            claim_url,
+        )
     except Exception:
         logger.exception("Could not send Twilio offer notification")
 
@@ -97,16 +111,40 @@ def get_message_details(payload: dict[str, Any]) -> tuple[str, str] | None:
 
 def handle_register(db: Session, phone: str, name: str, as_staff: bool) -> str:
     model = Staff if as_staff else Student
+    other_model = Student if as_staff else Staff
     existing = db.scalar(select(model).where(model.phone_nr == phone))
     role_name = "staff" if as_staff else "student"
     if existing:
         return f"You're already registered as {role_name}."
+
+    other_user = db.scalar(select(other_model).where(other_model.phone_nr == phone))
+    if other_user:
+        other_role = "student" if as_staff else "staff"
+        return f"This phone number is already registered as {other_role}. Use /logout first for testing."
 
     user = model(name=name, phone_nr=phone)
     db.add(user)
     db.commit()
     logger.info("Registered %s user %s", role_name, phone[-4:])
     return f"You're registered as a {role_name}, {name}!"
+
+
+def logout_user(db: Session, phone: str) -> str:
+    student = db.scalar(select(Student).where(Student.phone_nr == phone))
+    staff = db.scalar(select(Staff).where(Staff.phone_nr == phone))
+    if student is None and staff is None:
+        return "You are not registered."
+
+    if student:
+        claims = list(db.scalars(select(Claim).where(Claim.student_id == student.id)))
+        for claim in claims:
+            db.delete(claim)
+        db.delete(student)
+    if staff:
+        db.delete(staff)
+    db.commit()
+    logger.info("Logged out user ...%s", phone[-4:])
+    return "You have been logged out. You can now use /register or /staff."
 
 
 def format_offers(offers: list[Offer]) -> str:
@@ -204,7 +242,19 @@ def handle_staff_command(
     command: str,
     argument: str,
     notifier=safe_send_claim_button,
+    sender_phone: str | None = None,
 ) -> str:
+    if command == "/demo":
+        parsed = parse_new_offer(argument)
+        if parsed is None:
+            return "Please use:\n\n/demo Description - Quantity\n\nExample:\n/demo Pizza - 10 slices"
+        if sender_phone is None:
+            return "The demo command is only available through a messaging webhook."
+        description, quantity = parsed
+        offer = create_offer(db, description, quantity)
+        notifier(sender_phone, offer)
+        return f"Demo offer #{offer.id} created and sent to this phone only."
+
     if command == "/new":
         parsed = parse_new_offer(argument)
         if parsed is None:
@@ -243,6 +293,9 @@ def handle_text_command(
     student = db.scalar(select(Student).where(Student.phone_nr == phone))
     staff = db.scalar(select(Staff).where(Staff.phone_nr == phone))
 
+    if command == "/logout":
+        return logout_user(db, phone)
+
     if command == "/register":
         if not argument:
             return "Please provide your name.\n\nExample:\n/register Bob Smith"
@@ -267,7 +320,7 @@ def handle_text_command(
         return format_offers(offers)
 
     if staff:
-        return handle_staff_command(db, staff, command, argument, notifier)
+        return handle_staff_command(db, staff, command, argument, notifier, phone)
 
     if command.startswith("/"):
         return "Sorry, I don't understand that command.\n\nTry:\n/offers"
@@ -314,6 +367,22 @@ def dashboard(db: Session = Depends(get_db)) -> str:
     return dashboard_html(db)
 
 
+@app.get("/claim/{offer_id}", response_class=HTMLResponse)
+def claim_from_link(
+    offer_id: int,
+    phone: str = Query(..., min_length=1),
+    db: Session = Depends(get_db),
+) -> str:
+    normalized_phone = normalize_phone(phone)
+    result = claim_offer(db, normalized_phone, offer_id)
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>PlateShare claim</title>
+<style>body{{font-family:system-ui,sans-serif;max-width:520px;margin:4rem auto;padding:0 1rem}}
+main{{border:1px solid #ccc;border-radius:8px;padding:2rem}}a{{display:inline-block;margin-top:1rem}}</style>
+</head><body><main><h1>PlateShare</h1><p>{escape(result)}</p>
+<a href="/dashboard">View dashboard</a></main></body></html>"""
+
+
 @app.get("/webhook", response_class=PlainTextResponse)
 def verify_webhook(
     mode: str | None = Query(default=None, alias="hub.mode"),
@@ -326,8 +395,19 @@ def verify_webhook(
     return PlainTextResponse("Verification failed", status_code=403)
 
 
-@app.post("/webhook")
-async def receive_webhook(request: Request, db: Session = Depends(get_db)) -> dict[str, str]:
+@app.post("/webhook", response_model=None)
+async def receive_webhook(request: Request, db: Session = Depends(get_db)) -> dict[str, str] | JSONResponse:
+    content_type = request.headers.get("content-type", "").lower()
+    if "application/json" not in content_type:
+        logger.error(
+            "Meta webhook received a non-JSON request. Configure Twilio to use "
+            "/twilio/webhook."
+        )
+        return JSONResponse(
+            {"status": "wrong_endpoint", "message": "Use /twilio/webhook for Twilio."},
+            status_code=415,
+        )
+
     payload = await request.json()
     details = get_message_details(payload)
     if details is None:

@@ -110,6 +110,8 @@ Add these variables to the Render Web Service:
 TWILIO_ACCOUNT_SID=<Twilio Account SID>
 TWILIO_AUTH_TOKEN=<Twilio Auth Token>
 TWILIO_WHATSAPP_NUMBER=whatsapp:<Twilio Sandbox number>
+TWILIO_OFFER_CONTENT_SID=<Twilio Content Template SID with a URL button>
+APP_BASE_URL=https://YOUR-RENDER-SERVICE.onrender.com
 ```
 
 Join the Sandbox from each test phone using Twilio's join code. Then send normal WhatsApp text commands. The same commands and database behavior are used as the Meta route:
@@ -122,4 +124,22 @@ Join the Sandbox from each test phone using Twilio's join code. Then send normal
 claim:1
 ```
 
-Twilio notifications use text instructions instead of Meta interactive buttons: reply with `claim:1` to claim offer 1. The Meta webhook remains available at `/webhook`.
+Twilio notifications include a clickable claim URL and also keep the text fallback `claim:1`. The link opens `/claim/1` and performs the same atomic claim operation. Set `APP_BASE_URL` to the public Render URL. The Meta webhook remains available at `/webhook`.
+
+To use a native WhatsApp CTA URL button, create a Twilio Content Template with variables for description, remaining quantity, and the claim URL button. Copy its `HX...` Content SID into `TWILIO_OFFER_CONTENT_SID` on Render. The application sends variables as `1=description`, `2=remaining`, and `3=claim URL`. If this variable is empty, the application uses the plain-text clickable-link fallback.
+
+For a Twilio trial demo, broadcasts to unverified student numbers can fail with Twilio error `572002`. A staff member can use this test-only command instead:
+
+```text
+/demo Pizza - 1 slice
+```
+
+It creates the offer and sends the announcement only back to the staff member who issued the command. The message includes `claim:ID`, which can be sent back to claim the offer. `/new` remains the normal broadcast command.
+
+For testing role changes, use:
+
+```text
+/logout
+```
+
+This removes the test phone's registration and its claims so the same phone can then use `/register` or `/staff`.
