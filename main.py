@@ -1,13 +1,15 @@
 import logging
 import os
 import re
+import base64
 from contextlib import asynccontextmanager
 from html import escape
 from typing import Any
 from urllib.parse import quote
 
+import httpx
 from fastapi import Depends, FastAPI, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -40,6 +42,29 @@ def normalize_phone(phone: str) -> str:
     return "".join(character for character in phone if character.isdigit())
 
 
+async def download_twilio_image(url: str, content_type: str) -> tuple[str, str] | None:
+    if not content_type.startswith("image/"):
+        return None
+
+    account_sid = os.getenv("TWILIO_ACCOUNT_SID")
+    auth_token = os.getenv("TWILIO_AUTH_TOKEN")
+    if not account_sid or not auth_token:
+        logger.error("Cannot download Twilio media without Twilio credentials")
+        return None
+
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.get(url, auth=(account_sid, auth_token))
+            response.raise_for_status()
+        if len(response.content) > 5 * 1024 * 1024:
+            logger.error("Rejected Twilio image larger than 5 MB")
+            return None
+        return base64.b64encode(response.content).decode("ascii"), content_type
+    except httpx.HTTPError:
+        logger.exception("Could not download Twilio image")
+        return None
+
+
 def safe_send_text(to: str, message: str) -> None:
     try:
         send_text(to, message)
@@ -70,12 +95,16 @@ def safe_send_twilio_claim_message(to: str, offer: Offer) -> None:
                 f"{base_url}/claim/{offer.id}"
                 f"?phone={quote(to, safe='')}"
             )
+        media_url = None
+        if base_url and offer.image_data:
+            media_url = f"{base_url}/offers/{offer.id}/image"
         send_claim_message(
             to,
             offer.id,
             offer.description,
             offer.remaining_quantity,
             claim_url,
+            media_url,
         )
     except Exception:
         logger.exception("Could not send Twilio offer notification")
@@ -160,12 +189,20 @@ def format_offers(offers: list[Offer]) -> str:
     return "\n\n".join(lines)
 
 
-def create_offer(db: Session, description: str, quantity: int) -> Offer:
+def create_offer(
+    db: Session,
+    description: str,
+    quantity: int,
+    image_data: str | None = None,
+    image_content_type: str | None = None,
+) -> Offer:
     offer = Offer(
         description=description,
         quantity=quantity,
         remaining_quantity=quantity,
         active=True,
+        image_data=image_data,
+        image_content_type=image_content_type,
     )
     db.add(offer)
     db.commit()
@@ -191,18 +228,6 @@ def claim_url(offer_id: int, phone: str) -> str | None:
     if not base_url:
         return None
     return f"{base_url}/claim/{offer_id}?phone={quote(phone, safe='')}"
-
-
-def demo_offer_message(offer: Offer, phone: str) -> str:
-    link = claim_url(offer.id, phone)
-    link_text = f"\n\nClaim here: {link}" if link else ""
-    return (
-        "Demo offer created!\n\n"
-        f"{offer.description}\n"
-        f"{offer.remaining_quantity} portions available\n\n"
-        f"Reply claim:{offer.id} to claim one portion."
-        f"{link_text}"
-    )
 
 
 def notify_students(db: Session, offer: Offer, notifier=safe_send_claim_button) -> None:
@@ -262,23 +287,24 @@ def handle_staff_command(
     argument: str,
     notifier=safe_send_claim_button,
     sender_phone: str | None = None,
+    image_data: str | None = None,
+    image_content_type: str | None = None,
 ) -> str:
     if command == "/demo":
-        parsed = parse_new_offer(argument)
-        if parsed is None:
-            return "Please use:\n\n/demo Description - Quantity\n\nExample:\n/demo Pizza - 10 slices"
-        if sender_phone is None:
-            return "The demo command is only available through a messaging webhook."
-        description, quantity = parsed
-        offer = create_offer(db, description, quantity)
-        return demo_offer_message(offer, sender_phone)
+        if not argument.isdigit():
+            return "Please use:\n\n/demo OfferID\n\nExample:\n/demo 5"
+        offer = db.get(Offer, int(argument))
+        if offer is None or not offer.active:
+            return "That offer does not exist or is already cancelled."
+        notify_students(db, offer, notifier)
+        return f"Offer #{offer.id} announcement sent to registered students."
 
     if command == "/new":
         parsed = parse_new_offer(argument)
         if parsed is None:
             return "Please use:\n\n/new Description - Quantity\n\nExample:\n/new Pizza - 10 slices"
         description, quantity = parsed
-        offer = create_offer(db, description, quantity)
+        offer = create_offer(db, description, quantity, image_data, image_content_type)
         notify_students(db, offer, notifier)
         return f"Offer #{offer.id} created and students were notified."
 
@@ -303,6 +329,8 @@ def handle_text_command(
     phone: str,
     body: str,
     notifier=safe_send_claim_button,
+    image_data: str | None = None,
+    image_content_type: str | None = None,
 ) -> str:
     words = body.split(maxsplit=1)
     command = words[0].lower() if words else ""
@@ -338,7 +366,16 @@ def handle_text_command(
         return format_offers(offers)
 
     if staff:
-        return handle_staff_command(db, staff, command, argument, notifier, phone)
+        return handle_staff_command(
+            db,
+            staff,
+            command,
+            argument,
+            notifier,
+            phone,
+            image_data,
+            image_content_type,
+        )
 
     if command.startswith("/"):
         return "Sorry, I don't understand that command.\n\nTry:\n/offers"
@@ -399,6 +436,17 @@ def claim_from_link(
 main{{border:1px solid #ccc;border-radius:8px;padding:2rem}}a{{display:inline-block;margin-top:1rem}}</style>
 </head><body><main><h1>PlateShare</h1><p>{escape(result)}</p>
 <a href="/dashboard">View dashboard</a></main></body></html>"""
+
+
+@app.get("/offers/{offer_id}/image")
+def offer_image(offer_id: int, db: Session = Depends(get_db)) -> Response:
+    offer = db.get(Offer, offer_id)
+    if not offer or not offer.image_data or not offer.image_content_type:
+        return Response(status_code=404)
+    return Response(
+        content=base64.b64decode(offer.image_data),
+        media_type=offer.image_content_type,
+    )
 
 
 @app.get("/webhook", response_class=PlainTextResponse)
@@ -467,6 +515,14 @@ async def receive_twilio_webhook(
         return PlainTextResponse(str(response), media_type="application/xml")
 
     logger.info("Received Twilio WhatsApp message from ...%s", phone[-4:])
+    image_data = None
+    image_content_type = None
+    media_url = str(form.get("MediaUrl0", ""))
+    media_content_type = str(form.get("MediaContentType0", ""))
+    if media_url:
+        downloaded_image = await download_twilio_image(media_url, media_content_type)
+        if downloaded_image:
+            image_data, image_content_type = downloaded_image
     if body.startswith("claim:"):
         offer_id_text = body.removeprefix("claim:")
         if not offer_id_text.isdigit():
@@ -482,6 +538,8 @@ async def receive_twilio_webhook(
                 phone,
                 body,
                 notifier=safe_send_twilio_claim_message,
+                image_data=image_data,
+                image_content_type=image_content_type,
             )
         )
 

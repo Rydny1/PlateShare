@@ -47,6 +47,7 @@ def send_claim_message(
     description: str,
     remaining: int,
     claim_url: str | None = None,
+    media_url: str | None = None,
 ) -> None:
     content_sid = os.getenv("TWILIO_OFFER_CONTENT_SID")
     if content_sid and claim_url:
@@ -65,12 +66,19 @@ def send_claim_message(
         return
 
     button_text = f"\n\nClaim here: {claim_url}" if claim_url else ""
-    send_text(
-        to,
-        "Leftover food available!\n\n"
-        f"{description}\n"
-        f"{remaining} portions available\n\n"
-        f"Reply claim:{offer_id} to claim one portion."
-        f"{button_text}\n"
-        "First come, first served!",
-    )
+    client = _client()
+    message_args = {
+        "from_": _from_address(),
+        "to": _whatsapp_address(to),
+        "body": (
+            "Leftover food available!\n\n"
+            f"{description}\n"
+            f"{remaining} portions available\n\n"
+            f"Reply claim:{offer_id} to claim one portion."
+            f"{button_text}\n"
+            "First come, first served!"
+        ),
+    }
+    if media_url:
+        message_args["media_url"] = [media_url]
+    client.messages.create(**message_args)

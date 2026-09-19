@@ -3,7 +3,7 @@ import os
 from collections.abc import Generator
 
 from dotenv import load_dotenv
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 
@@ -31,6 +31,14 @@ def create_tables() -> None:
     import models
 
     Base.metadata.create_all(bind=engine)
+    with engine.begin() as connection:
+        columns = {column["name"] for column in inspect(connection).get_columns("offers")}
+        if "image_data" not in columns:
+            connection.execute(text("ALTER TABLE offers ADD COLUMN image_data TEXT"))
+        if "image_content_type" not in columns:
+            connection.execute(
+                text("ALTER TABLE offers ADD COLUMN image_content_type VARCHAR(100)")
+            )
     logger.info("Database tables are ready")
 
 

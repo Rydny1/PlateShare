@@ -128,13 +128,13 @@ Twilio notifications include a clickable claim URL and also keep the text fallba
 
 To use a native WhatsApp CTA URL button, create a Twilio Content Template with variables for description, remaining quantity, and the claim URL button. Copy its `HX...` Content SID into `TWILIO_OFFER_CONTENT_SID` on Render. The application sends variables as `1=description`, `2=remaining`, and `3=claim URL`. If this variable is empty, the application uses the plain-text clickable-link fallback.
 
-For a Twilio trial demo, broadcasts to unverified student numbers can fail with Twilio error `572002`. A staff member can use this test-only command instead:
+For a Twilio trial demo, broadcasts to unverified student numbers can fail with Twilio error `572002`. A staff member can use this command to re-send an existing offer announcement:
 
 ```text
-/demo Pizza - 1 slice
+/demo 1
 ```
 
-It creates the offer and sends the announcement only back to the staff member who issued the command. The message includes `claim:ID`, which can be sent back to claim the offer. `/new` remains the normal broadcast command.
+It looks up offer `#1` and runs the same student-notification code used by `/new`; it does not create or modify the offer. The message includes `claim:ID`, which can be sent back to claim the offer. `/new` remains the normal offer-creation command.
 
 For testing role changes, use:
 

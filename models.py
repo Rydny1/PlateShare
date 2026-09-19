@@ -1,4 +1,4 @@
-from sqlalchemy import Boolean, CheckConstraint, ForeignKey, Integer, String, UniqueConstraint
+from sqlalchemy import Boolean, CheckConstraint, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from database import Base
@@ -32,6 +32,8 @@ class Offer(Base):
     quantity: Mapped[int] = mapped_column(Integer)
     remaining_quantity: Mapped[int] = mapped_column(Integer)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
+    image_data: Mapped[str | None] = mapped_column(Text, nullable=True)
+    image_content_type: Mapped[str | None] = mapped_column(String(100), nullable=True)
 
 
 class Claim(Base):
