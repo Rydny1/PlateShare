@@ -95,3 +95,31 @@ https://YOUR-RENDER-SERVICE.onrender.com/dashboard
 ## 5. Messaging limitation
 
 WhatsApp generally allows free-form replies during the customer-service window after a user messages the business. Proactive notifications outside that window may require an approved WhatsApp message template. For the hackathon, have test students message the Meta test number first and test within the allowed test-number/customer-service window.
+
+## 6. Twilio WhatsApp Sandbox
+
+The app also supports Twilio as a separate WhatsApp transport. Configure the Twilio Sandbox incoming-message webhook as:
+
+```text
+https://YOUR-RENDER-SERVICE.onrender.com/twilio/webhook
+```
+
+Add these variables to the Render Web Service:
+
+```text
+TWILIO_ACCOUNT_SID=<Twilio Account SID>
+TWILIO_AUTH_TOKEN=<Twilio Auth Token>
+TWILIO_WHATSAPP_NUMBER=whatsapp:<Twilio Sandbox number>
+```
+
+Join the Sandbox from each test phone using Twilio's join code. Then send normal WhatsApp text commands. The same commands and database behavior are used as the Meta route:
+
+```text
+/register Bob Smith
+/staff John Smith
+/new Pizza - 10 slices
+/offers
+claim:1
+```
+
+Twilio notifications use text instructions instead of Meta interactive buttons: reply with `claim:1` to claim offer 1. The Meta webhook remains available at `/webhook`.

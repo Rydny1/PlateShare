@@ -10,11 +10,13 @@ from fastapi.responses import HTMLResponse, PlainTextResponse
 from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from twilio.twiml.messaging_response import MessagingResponse
 
 from database import create_tables
 from database import get_db
 from models import Claim, Offer, Staff, Student
 from whatsapp import send_claim_button, send_text
+from twilio_client import send_claim_message, send_text as send_twilio_text
 
 
 logging.basicConfig(level=logging.INFO)
@@ -49,6 +51,20 @@ def safe_send_claim_button(to: str, offer: Offer) -> None:
         send_claim_button(to, offer.id, offer.description, offer.remaining_quantity)
     except Exception:
         logger.exception("Could not send offer notification")
+
+
+def safe_send_twilio_text(to: str, message: str) -> None:
+    try:
+        send_twilio_text(to, message)
+    except Exception:
+        logger.exception("Could not send Twilio WhatsApp message")
+
+
+def safe_send_twilio_claim_message(to: str, offer: Offer) -> None:
+    try:
+        send_claim_message(to, offer.id, offer.description, offer.remaining_quantity)
+    except Exception:
+        logger.exception("Could not send Twilio offer notification")
 
 
 def registration_help() -> str:
@@ -132,10 +148,10 @@ def parse_new_offer(argument: str) -> tuple[str, int] | None:
     return description, quantity
 
 
-def notify_students(db: Session, offer: Offer) -> None:
+def notify_students(db: Session, offer: Offer, notifier=safe_send_claim_button) -> None:
     students = list(db.scalars(select(Student).order_by(Student.id)))
     for student in students:
-        safe_send_claim_button(student.phone_nr, offer)
+        notifier(student.phone_nr, offer)
 
 
 def claim_offer(db: Session, phone: str, offer_id: int) -> str:
@@ -182,14 +198,20 @@ def claim_offer(db: Session, phone: str, offer_id: int) -> str:
     )
 
 
-def handle_staff_command(db: Session, staff: Staff, command: str, argument: str) -> str:
+def handle_staff_command(
+    db: Session,
+    staff: Staff,
+    command: str,
+    argument: str,
+    notifier=safe_send_claim_button,
+) -> str:
     if command == "/new":
         parsed = parse_new_offer(argument)
         if parsed is None:
             return "Please use:\n\n/new Description - Quantity\n\nExample:\n/new Pizza - 10 slices"
         description, quantity = parsed
         offer = create_offer(db, description, quantity)
-        notify_students(db, offer)
+        notify_students(db, offer, notifier)
         return f"Offer #{offer.id} created and students were notified."
 
     if command == "/cancel":
@@ -208,7 +230,12 @@ def handle_staff_command(db: Session, staff: Staff, command: str, argument: str)
     return "Staff commands:\n/new Food - Quantity\n/offers\n/cancel OfferID"
 
 
-def handle_text_command(db: Session, phone: str, body: str) -> str:
+def handle_text_command(
+    db: Session,
+    phone: str,
+    body: str,
+    notifier=safe_send_claim_button,
+) -> str:
     words = body.split(maxsplit=1)
     command = words[0].lower() if words else ""
     argument = words[1].strip() if len(words) == 2 else ""
@@ -240,7 +267,7 @@ def handle_text_command(db: Session, phone: str, body: str) -> str:
         return format_offers(offers)
 
     if staff:
-        return handle_staff_command(db, staff, command, argument)
+        return handle_staff_command(db, staff, command, argument, notifier)
 
     if command.startswith("/"):
         return "Sorry, I don't understand that command.\n\nTry:\n/offers"
@@ -324,3 +351,40 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)) -> di
     response = handle_text_command(db, phone, body)
     safe_send_text(phone, response)
     return {"status": "ok"}
+
+
+@app.post("/twilio/webhook", response_class=PlainTextResponse)
+async def receive_twilio_webhook(
+    request: Request,
+    db: Session = Depends(get_db),
+) -> PlainTextResponse:
+    form = await request.form()
+    sender = str(form.get("From", ""))
+    body = str(form.get("Body", "")).strip()
+    phone = normalize_phone(sender)
+    response = MessagingResponse()
+
+    if not phone:
+        response.message("Sorry, we could not identify your WhatsApp number.")
+        return PlainTextResponse(str(response), media_type="application/xml")
+
+    logger.info("Received Twilio WhatsApp message from ...%s", phone[-4:])
+    if body.startswith("claim:"):
+        offer_id_text = body.removeprefix("claim:")
+        if not offer_id_text.isdigit():
+            response.message("Sorry, that claim message is invalid.")
+        else:
+            response.message(claim_offer(db, phone, int(offer_id_text)))
+    elif not body:
+        response.message("Please send a text command, such as /offers.")
+    else:
+        response.message(
+            handle_text_command(
+                db,
+                phone,
+                body,
+                notifier=safe_send_twilio_claim_message,
+            )
+        )
+
+    return PlainTextResponse(str(response), media_type="application/xml")

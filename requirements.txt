@@ -4,3 +4,5 @@ sqlalchemy
 psycopg2-binary
 httpx
 python-dotenv
+python-multipart
+twilio
