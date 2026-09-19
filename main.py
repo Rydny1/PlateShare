@@ -13,6 +13,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Res
 from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from twilio.base.exceptions import TwilioRestException
 from twilio.twiml.messaging_response import MessagingResponse
 
 from database import create_tables
@@ -72,21 +73,16 @@ def safe_send_text(to: str, message: str) -> None:
         logger.exception("Could not send WhatsApp response")
 
 
-def safe_send_claim_button(to: str, offer: Offer) -> None:
+def safe_send_claim_button(to: str, offer: Offer) -> bool:
     try:
         send_claim_button(to, offer.id, offer.description, offer.remaining_quantity)
+        return True
     except Exception:
         logger.exception("Could not send offer notification")
+        return False
 
 
-def safe_send_twilio_text(to: str, message: str) -> None:
-    try:
-        send_twilio_text(to, message)
-    except Exception:
-        logger.exception("Could not send Twilio WhatsApp message")
-
-
-def safe_send_twilio_claim_message(to: str, offer: Offer) -> None:
+def safe_send_twilio_claim_message(to: str, offer: Offer) -> bool:
     try:
         base_url = os.getenv("APP_BASE_URL", "").rstrip("/")
         claim_url = None
@@ -106,8 +102,20 @@ def safe_send_twilio_claim_message(to: str, offer: Offer) -> None:
             claim_url,
             media_url,
         )
+        return True
+    except TwilioRestException as error:
+        if error.code == 572002:
+            logger.warning(
+                "Twilio trial blocked offer #%s for recipient ...%s; recipient is not verified",
+                offer.id,
+                to[-4:],
+            )
+        else:
+            logger.exception("Twilio rejected offer notification")
+        return False
     except Exception:
         logger.exception("Could not send Twilio offer notification")
+        return False
 
 
 def registration_help() -> str:
@@ -230,10 +238,18 @@ def claim_url(offer_id: int, phone: str) -> str | None:
     return f"{base_url}/claim/{offer_id}?phone={quote(phone, safe='')}"
 
 
-def notify_students(db: Session, offer: Offer, notifier=safe_send_claim_button) -> None:
+def offer_image_url(offer_id: int) -> str | None:
+    base_url = os.getenv("APP_BASE_URL", "").rstrip("/")
+    return f"{base_url}/offers/{offer_id}/image" if base_url else None
+
+
+def notify_students(db: Session, offer: Offer, notifier=safe_send_claim_button) -> tuple[int, int]:
     students = list(db.scalars(select(Student).order_by(Student.id)))
+    delivered = 0
     for student in students:
-        notifier(student.phone_nr, offer)
+        if notifier(student.phone_nr, offer):
+            delivered += 1
+    return delivered, len(students) - delivered
 
 
 def claim_offer(db: Session, phone: str, offer_id: int) -> str:
@@ -296,8 +312,17 @@ def handle_staff_command(
         offer = db.get(Offer, int(argument))
         if offer is None or not offer.active:
             return "That offer does not exist or is already cancelled."
-        notify_students(db, offer, notifier)
-        return f"Offer #{offer.id} announcement sent to registered students."
+        announcement = (
+            "Leftover food available!\n\n"
+            f"Offer #{offer.id}: {offer.description}\n"
+            f"{offer.remaining_quantity} portions available\n\n"
+            f"Reply claim:{offer.id} to claim one portion."
+        )
+        if offer.image_data:
+            image_url = offer_image_url(offer.id)
+            if image_url:
+                announcement += f"\n\nImage: {image_url}"
+        return announcement
 
     if command == "/new":
         parsed = parse_new_offer(argument)
@@ -305,8 +330,7 @@ def handle_staff_command(
             return "Please use:\n\n/new Description - Quantity\n\nExample:\n/new Pizza - 10 slices"
         description, quantity = parsed
         offer = create_offer(db, description, quantity, image_data, image_content_type)
-        notify_students(db, offer, notifier)
-        return f"Offer #{offer.id} created and students were notified."
+        return f"Offer #{offer.id} created. Use /demo {offer.id} to send a test announcement."
 
     if command == "/cancel":
         if not argument.isdigit():
@@ -386,11 +410,12 @@ def handle_text_command(
 def dashboard_html(db: Session) -> str:
     students = db.scalar(select(func.count()).select_from(Student)) or 0
     staff = db.scalar(select(func.count()).select_from(Staff)) or 0
-    active_offers = list(
-        db.scalars(select(Offer).where(Offer.active.is_(True)).order_by(Offer.id))
-    )
+    offers = list(db.scalars(select(Offer).order_by(Offer.id)))
+    students_list = list(db.scalars(select(Student).order_by(Student.id)))
+    staff_list = list(db.scalars(select(Staff).order_by(Staff.id)))
+    claims = list(db.scalars(select(Claim).order_by(Claim.id)))
     total_offered = db.scalar(select(func.coalesce(func.sum(Offer.quantity), 0))) or 0
-    total_claimed = db.scalar(select(func.count()).select_from(Claim)) or 0
+    total_claimed = len(claims)
 
     offer_rows = "".join(
         "<tr>"
@@ -399,22 +424,41 @@ def dashboard_html(db: Session) -> str:
         f"<td>{offer.quantity}</td>"
         f"<td>{offer.remaining_quantity}</td>"
         f"<td>{offer.quantity - offer.remaining_quantity}</td>"
+        f"<td>{'Yes' if offer.active else 'No'}</td>"
+        f"<td>{f'<img src=\"{offer_image_url(offer.id)}\" width=\"80\" alt=\"food\">' if offer.image_data else 'No image'}</td>"
         "</tr>"
-        for offer in active_offers
+        for offer in offers
+    )
+    student_rows = "".join(
+        f"<tr><td>{student.id}</td><td>{escape(student.name)}</td><td>{escape(student.phone_nr)}</td></tr>"
+        for student in students_list
+    )
+    staff_rows = "".join(
+        f"<tr><td>{member.id}</td><td>{escape(member.name)}</td><td>{escape(member.phone_nr)}</td></tr>"
+        for member in staff_list
+    )
+    claim_rows = "".join(
+        f"<tr><td>{claim.id}</td><td>#{claim.offer_id}</td><td>{claim.student_id}</td></tr>"
+        for claim in claims
     )
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>PlateShare dashboard</title>
 <style>body{{font-family:system-ui,sans-serif;max-width:900px;margin:2rem auto;padding:0 1rem}}
 .stats{{display:flex;gap:1rem;flex-wrap:wrap}}.stat{{border:1px solid #ccc;padding:1rem;min-width:120px}}
-table{{border-collapse:collapse;width:100%;margin-top:1rem}}th,td{{border:1px solid #ccc;padding:.5rem;text-align:left}}</style>
+table{{border-collapse:collapse;width:100%;margin:1rem 0 2rem}}th,td{{border:1px solid #ccc;padding:.5rem;text-align:left}}
+img{{object-fit:cover}}</style>
 </head><body><h1>PlateShare dashboard</h1><div class="stats">
 <div class="stat">Students<br><strong>{students}</strong></div>
 <div class="stat">Staff<br><strong>{staff}</strong></div>
 <div class="stat">Portions offered<br><strong>{total_offered}</strong></div>
 <div class="stat">Portions claimed<br><strong>{total_claimed}</strong></div>
 <div class="stat">Food saved<br><strong>{total_claimed} portions</strong></div>
-</div><h2>Active offers</h2><table><tr><th>Offer</th><th>Description</th>
-<th>Quantity</th><th>Remaining</th><th>Claims</th></tr>{offer_rows}</table></body></html>"""
+</div><h2>Offers</h2><table><tr><th>ID</th><th>Description</th><th>Quantity</th>
+<th>Remaining</th><th>Claims</th><th>Active</th><th>Image</th></tr>{offer_rows}</table>
+<h2>Students</h2><table><tr><th>ID</th><th>Name</th><th>Phone</th></tr>{student_rows}</table>
+<h2>Staff</h2><table><tr><th>ID</th><th>Name</th><th>Phone</th></tr>{staff_rows}</table>
+<h2>Claims</h2><table><tr><th>ID</th><th>Offer ID</th><th>Student ID</th></tr>{claim_rows}</table>
+</body></html>"""
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
