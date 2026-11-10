@@ -1,2 +1,6 @@
-.env 
-node_modules 
+.env
+.env.*
+node_modules/
+.next/
+*.tsbuildinfo
+.DS_Store
